@@ -1,0 +1,6 @@
+streamlit
+beir
+sentence-transformers
+transformers
+torch
+scikit-learn
