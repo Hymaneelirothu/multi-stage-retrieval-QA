@@ -10,7 +10,10 @@ def load_dataset(num_docs=100):
         # Check if corpus is loaded properly
         if corpus is None or len(corpus) == 0:
             raise ValueError("Corpus not loaded properly or is empty.")
-
+        
+        # Debugging: check the type and structure of corpus
+        print(f"Loaded Corpus: {type(corpus)}, Number of Documents: {len(corpus)}")
+        
         # Limit the size of the corpus for memory efficiency
         small_corpus = {k: corpus[k] for k in list(corpus.keys())[:num_docs]}
         return small_corpus, queries, qrels
@@ -18,4 +21,3 @@ def load_dataset(num_docs=100):
     except Exception as e:
         print(f"Error loading dataset: {e}")
         return None, None, None
-
