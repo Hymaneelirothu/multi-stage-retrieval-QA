@@ -1,49 +1,112 @@
 import streamlit as st
-from data_preparation import load_dataset
-from retrieval import load_embedding_model, retrieve_top_k
-from reranking import load_ranking_model, rerank
+from sentence_transformers import SentenceTransformer, util
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
+import numpy as np
+from sklearn.metrics import ndcg_score
 
-# Streamlit App
-st.title("Multi-Stage Text Retrieval Pipeline for QA")
+# Helper function to load the dataset
+def download_and_extract_dataset():
+    import urllib.request
+    import zipfile
+    import os
 
-# Input question
-query = st.text_input("Enter a question:")
+    dataset_url = "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/nq.zip"
+    dataset_zip_path = "nq.zip"
+    data_path = "./datasets/nq"
 
-# Select embedding model
-embed_model_name = st.selectbox("Select Embedding Model for Candidate Retrieval", 
-                                  ("sentence-transformers/all-MiniLM-L6-v2", "nvidia/nv-embedqa-e5-v5"))
-embed_model = load_embedding_model(embed_model_name)
+    # Download the dataset if not already downloaded
+    if not os.path.exists(dataset_zip_path):
+        st.write("Downloading the dataset... This may take a few minutes.")
+        urllib.request.urlretrieve(dataset_url, dataset_zip_path)
+        st.write("Download complete!")
 
-# Load dataset
-corpus, queries, qrels = load_dataset(num_docs=100)
+    # Unzip the dataset if not already unzipped
+    if not os.path.exists(data_path):
+        st.write("Unzipping the dataset...")
+        with zipfile.ZipFile(dataset_zip_path, 'r') as zip_ref:
+            zip_ref.extractall("./datasets")
+        st.write("Dataset unzipped!")
 
-if query:
-    st.write("Loading embedding model...")
-    st.write("Loading dataset...")
+    return data_path
+
+# Function to load corpus, queries, and qrels
+def load_dataset():
+    from beir.datasets.data_loader import GenericDataLoader
+    data_path = download_and_extract_dataset()
+    corpus, queries, qrels = GenericDataLoader(data_path).load(split="test")
+    return corpus, queries, qrels
+
+# Stage 1: Candidate retrieval using Sentence Transformer
+def candidate_retrieval(query, corpus, top_k=10):
+    model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+    corpus_ids = list(corpus.keys())
+    corpus_embeddings = model.encode([corpus[doc_id]['text'] for doc_id in corpus_ids], convert_to_tensor=True)
+
+    query_embedding = model.encode(query, convert_to_tensor=True)
+    hits = util.semantic_search(query_embedding, corpus_embeddings, top_k=top_k)[0]
     
-    # Retrieve top-k passages
-    st.write("Retrieving top-k passages...")
-    try:
-        top_k_passages = retrieve_top_k(embed_model, query, corpus, k=10)
+    retrieved_docs = [corpus_ids[hit['corpus_id']] for hit in hits]
+    return retrieved_docs
 
-        # Display retrieved passages
-        st.write("Top-k passages before reranking:")
-        for passage in top_k_passages:
-            st.write(passage)
+# Stage 2: Reranking using cross-encoder
+def rerank(retrieved_docs, query, corpus, top_k=5):
+    tokenizer = AutoTokenizer.from_pretrained("cross-encoder/ms-marco-MiniLM-L-12-v2")
+    model = AutoModelForSequenceClassification.from_pretrained("cross-encoder/ms-marco-MiniLM-L-12-v2")
 
-        # Select ranking model
-        rank_model_name = st.selectbox("Select Ranking Model for Re-Ranking", 
-                                        ("cross-encoder/ms-marco-MiniLM-L-12-v2", "nvidia/nv-rerankqa-mistral-4b-v3"))
-        rank_model, rank_tokenizer = load_ranking_model(rank_model_name)
+    scores = []
+    for doc_id in retrieved_docs:
+        text = corpus[doc_id]['text']
+        inputs = tokenizer(query, text, return_tensors="pt", truncation=True, padding=True)
+        outputs = model(**inputs)
+        scores.append(outputs.logits.item())
 
-        # Rerank the passages
-        st.write("Reranking passages...")
-        reranked_passages = rerank(rank_model, rank_tokenizer, query, top_k_passages)
+    reranked_indices = np.argsort(scores)[::-1][:top_k]
+    reranked_docs = [retrieved_docs[idx] for idx in reranked_indices]
+    return reranked_docs, scores
 
-        # Display reranked passages
-        st.write("Reranked passages:")
-        for passage in reranked_passages:
-            st.write(passage)
+# Function to evaluate using NDCG@10
+def evaluate_ndcg(reranked_docs, qrels, query_id, k=10):
+    true_relevance = [qrels.get((query_id, doc_id), 0) for doc_id in reranked_docs]
+    ideal_relevance = sorted(true_relevance, reverse=True)
+    
+    # NDCG expects input as 2D arrays
+    return ndcg_score([ideal_relevance], [true_relevance], k=k)
 
-    except Exception as e:
-        st.write(f"Error during retrieval: {e}")
+# Streamlit main function
+def main():
+    st.title("Multi-Stage Retrieval Pipeline with Evaluation")
+
+    st.write("Loading the dataset...")
+    corpus, queries, qrels = load_dataset()
+    st.write(f"Corpus Size: {len(corpus)}")
+    
+    # User input for asking a question
+    user_query = st.text_input("Ask a question:")
+    
+    if user_query:
+        st.write(f"Your query: {user_query}")
+        
+        st.write("Running Candidate Retrieval...")
+        retrieved_docs = candidate_retrieval(user_query, corpus, top_k=10)
+        
+        st.write("Running Reranking...")
+        reranked_docs, rerank_scores = rerank(retrieved_docs, user_query, corpus, top_k=5)
+        
+        st.write("Top Reranked Documents:")
+        for doc_id in reranked_docs:
+            st.write(f"Document ID: {doc_id}")
+            st.write(f"Document Text: {corpus[doc_id]['text'][:500]}...")  # Show the first 500 characters of the document
+        
+        # Evaluation if the user query exists in the qrels (ground truth relevance labels)
+        query_id = list(queries.keys())[0]  # Dummy query ID for now
+        if query_id in queries:
+            ndcg_score_value = evaluate_ndcg(reranked_docs, qrels, query_id, k=10)
+            st.write(f"NDCG@10 Score: {ndcg_score_value}")
+        else:
+            st.write("No ground truth available for this query.")
+        
+        st.write("Query executed successfully!")
+
+if __name__ == "__main__":
+    main()
